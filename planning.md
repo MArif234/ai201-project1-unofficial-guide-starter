@@ -42,7 +42,7 @@ Is a specific fellowship program that gives a full ride to a Heinz College stude
 
 3. ProFellow Database: 
 https://www.profellow.com/fellowship/ 
-Specifically lists certain fellowships that an information system student at Carnegie Mellon could potentially use to fund their education. 
+Specifically lists certain fellowships that an information system student at Carnegie Mellon could potentially use to fund their education. Specifically looking at the Paragon Policy Fellowship here that was found on the database.
 
 4. Heinz Merit-Based Scholarships: 
 https://www.heinz.cmu.edu/programs/information-systems-management-master/financial-aid-and-scholarships-mism 
