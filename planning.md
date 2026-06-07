@@ -184,5 +184,6 @@ Each year, Heinz College awards an additional $2,000 per semester scholarship to
 
 **Milestone 4 — Embedding and retrieval:** 
 For milestone four, I will be using Claude. I will give it my MD file, specifically the retrieval approach part of it, and I will also give it the pipeline diagram that I made. Claude will be able to generate a Python script that takes those chunks and stores them in the chroma b database. It'll have some sort of function that returns relevant chunks based on the question that's being asked. To check that this is working, I will take some of the test questions that I made, and I'll see what chunks get printed when I ask them to make sure that it's talking about the correct things. 
+
 **Milestone 5 — Generation and interface:**
 I'll be using Claude for this milestone. Giving it the.md file, and I will tell it to take those trunks and run them through grok to see what answers will be coming out. I'll try to ask it questions that aren't as relevant to the documents that I gave it, to make sure that it's either giving the correct answer or that it actually just says it doesn't have enough information to answer the question, rather than hallucinating. 
