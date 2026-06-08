@@ -36,6 +36,18 @@ from pathlib import Path
 # quotes, etc.) never crash the program when we print a chunk.
 import sys
 
+# "os" lets us read environment variables (like our secret API key).
+import os
+
+# --- Milestone 5 libraries ---
+# load_dotenv reads the .env file and loads GROQ_API_KEY into the environment
+# so we never have to paste the secret key into our code.
+from dotenv import load_dotenv
+
+# Groq is the company whose API runs the llama-3.3-70b model that writes our
+# final answers. This is the only part of the pipeline that calls the internet.
+from groq import Groq
+
 # --- Milestone 4 libraries (these need to be pip-installed) ---
 # SentenceTransformer is the tool that turns a piece of text into a list of
 # numbers (a "vector" / "embedding") that captures its meaning. Two texts with
@@ -75,6 +87,9 @@ TOP_K = 4                                   # how many chunks to retrieve per qu
 # in a "chroma_db" folder next to main.py.
 CHROMA_DIR = Path(__file__).parent / "chroma_db"
 COLLECTION_NAME = "scholarships"            # a name for our group of stored chunks
+
+# --- Milestone 5 settings (from my planning.md Architecture) ---
+GROQ_MODEL = "llama-3.3-70b-versatile"      # the LLM on Groq that writes answers
 
 
 # ---------------------------------------------------------------------------
@@ -382,11 +397,138 @@ def retrieve(query: str, collection, model, k: int = TOP_K) -> list[dict]:
     return hits
 
 
+# ===========================================================================
+# MILESTONE 5: GROUNDED GENERATION (Groq) + END-TO-END ask()
+# ===========================================================================
+
+# This is the GROUNDING INSTRUCTION — the most important part of preventing the
+# model from making things up. It tells the model to use ONLY the documents we
+# give it, and to admit when it can't answer instead of inventing an answer.
+SYSTEM_PROMPT = (
+    "You are a helpful assistant that answers questions about scholarships and "
+    "fellowships for graduate students at Carnegie Mellon's Heinz College.\n"
+    "Answer the question using ONLY the information in the provided documents. "
+    "Do not use any outside knowledge, and do not invent scholarships, dollar "
+    "amounts, eligibility rules, or deadlines.\n"
+    "If the documents do not contain enough information to answer, respond with "
+    "exactly: \"I don't have enough information on that.\""
+)
+
+
+# These two are "lazy singletons": we build them once on first use and then
+# reuse them, so we don't reload the model or reconnect to Groq on every query.
+_groq_client = None   # will hold the connection to Groq
+_pipeline = None      # will hold (collection, model) so we don't re-embed each time
+
+
+def get_groq_client() -> Groq:
+    """Create (once) and return the Groq client, reading the key from .env."""
+    global _groq_client
+    if _groq_client is None:
+        # load_dotenv() reads the .env file and makes GROQ_API_KEY available.
+        load_dotenv()
+        api_key = os.environ.get("GROQ_API_KEY")
+
+        # Helpful error if the key is missing or still the placeholder, so the
+        # failure message is clear instead of a confusing API error.
+        if not api_key or api_key == "your_key_here":
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. Copy .env.example to .env and put your "
+                "real Groq key in it (get one free at https://console.groq.com)."
+            )
+        _groq_client = Groq(api_key=api_key)
+    return _groq_client
+
+
+def get_pipeline():
+    """Build the chunk database + model once, then reuse it for every query."""
+    global _pipeline
+    if _pipeline is None:
+        documents = load_documents(DOCUMENTS_DIR)
+        all_chunks = chunk_all_documents(documents)
+        collection, model = build_vector_store(all_chunks)
+        _pipeline = (collection, model)
+    return _pipeline
+
+
+def format_context(hits: list[dict]) -> str:
+    """
+    Turn the retrieved chunks into one labeled text block for the prompt.
+
+    We label each chunk with its source filename so (a) the model can cite it
+    and (b) the context is clearly separated into distinct documents.
+    """
+    blocks = []
+    for i, hit in enumerate(hits, start=1):
+        blocks.append(f"[Document {i} — source: {hit['filename']}]\n{hit['text']}")
+    return "\n\n".join(blocks)
+
+
+def generate_answer(question: str, hits: list[dict]) -> str:
+    """
+    Send the retrieved context + the question to Groq and return the answer.
+
+    The model is instructed (via SYSTEM_PROMPT) to answer ONLY from this
+    context. We set a low temperature so it stays factual rather than creative.
+    """
+    client = get_groq_client()
+    context = format_context(hits)
+
+    # The user message gives the model the documents, then the question. Putting
+    # the documents first and the rule last keeps the grounding instruction
+    # fresh in the model's "mind" right before it answers.
+    user_message = (
+        f"Here are the documents you may use:\n\n{context}\n\n"
+        f"Question: {question}\n\n"
+        "Answer using only the documents above."
+    )
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.2,   # low = factual and consistent, not creative
+    )
+
+    # The API returns a nested object; this digs out the actual text answer.
+    return response.choices[0].message.content.strip()
+
+
+def ask(question: str, k: int = TOP_K) -> dict:
+    """
+    THE END-TO-END FUNCTION. Give it a question, get back an answer + sources.
+
+    Steps: retrieve the top-k chunks -> generate a grounded answer -> collect
+    the source filenames. Returns:
+        {"answer": "...", "sources": ["file_a.txt", "file_b.txt"]}
+
+    The 'sources' are attached PROGRAMMATICALLY from the retrieved chunks, so
+    attribution is always accurate regardless of what the model writes.
+    """
+    collection, model = get_pipeline()
+
+    # 1. Retrieve the most relevant chunks for this question.
+    hits = retrieve(question, collection, model, k=k)
+
+    # 2. Generate a grounded answer from those chunks.
+    answer = generate_answer(question, hits)
+
+    # 3. Collect the unique source filenames, keeping their retrieval order.
+    sources = []
+    for hit in hits:
+        if hit["filename"] not in sources:
+            sources.append(hit["filename"])
+
+    return {"answer": answer, "sources": sources}
+
+
 # ---------------------------------------------------------------------------
-# STEP 5: THE MAIN PROGRAM  (this is what actually runs)
+# STEP 6: THE MAIN PROGRAM  (this is what actually runs)
 # ---------------------------------------------------------------------------
 def main():
-    """Run the pipeline: load -> chunk -> embed/store -> test retrieval."""
+    """Run the pipeline: load -> chunk -> embed/store -> grounded generation."""
     # ---- Load every document from the documents/ folder ----
     print("Loading documents from:", DOCUMENTS_DIR)
     documents = load_documents(DOCUMENTS_DIR)
@@ -426,39 +568,60 @@ def main():
             print(chunk["text"])
             print("-" * 70)
 
-    # ---- (Milestone 4) Embed the chunks and store them in ChromaDB ----
-    collection, model = build_vector_store(all_chunks)
+    # ---- (Milestone 4) Optionally show the raw retrieval results ----
+    # This was Milestone 4's deliverable. Off by default now so the output
+    # focuses on the full answers. Flip to True to see which chunks get pulled.
+    SHOW_RETRIEVAL_TEST = False
+    if SHOW_RETRIEVAL_TEST:
+        collection, model = get_pipeline()
+        retrieval_questions = [
+            "What is a specific full-tuition scholarship or fellowship that a Heinz "
+            "Information Systems Management student could win?",
+            "What specific colleges or universities partner with Heinz College at "
+            "Carnegie Mellon University to receive scholarships?",
+        ]
+        print("=" * 70)
+        print(f"RETRIEVAL TEST — top-{TOP_K} chunks for each question")
+        print("=" * 70)
+        for q_number, question in enumerate(retrieval_questions, start=1):
+            print(f"\n########## QUESTION {q_number} ##########")
+            print(f"Q: {question}\n")
+            for rank, hit in enumerate(retrieve(question, collection, model, k=TOP_K), start=1):
+                print(f"  --- Result {rank} (relevance: {hit['relevance']:.3f}) ---")
+                print(f"  Source: {hit['filename']}  (chunk {hit['chunk_index']})")
+                print(f"  Text: {hit['text']}")
+                print()
 
-    # ---- (Milestone 4) Test retrieval on my first 3 evaluation questions ----
-    # These come straight from the Evaluation Plan in planning.md. For each one
-    # we retrieve the top-k chunks and print them so I can judge whether the
-    # RIGHT pieces of text were found (before any AI answer is generated).
-    test_questions = [
+    # ---- (Milestone 5) Test grounded generation END-TO-END ----
+    # We ask real questions AND one off-topic question. The off-topic one checks
+    # that the system says "I don't have enough information" instead of making
+    # something up — i.e., that grounding actually works.
+    generation_questions = [
+        # From my evaluation plan (should answer well):
         "What is a specific full-tuition scholarship or fellowship that a Heinz "
         "Information Systems Management student could win?",
-        "What specific colleges or universities partner with Heinz College at "
-        "Carnegie Mellon University to receive scholarships?",
-        "Can you list the merit-based scholarships that an information systems "
-        "management student at Heinz College could win based on their college application?",
+        "For the What Will Be Your Trademark Scholarship essay contest, what is "
+        "the essay prompt?",
+        # Off-topic (should REFUSE, proving it doesn't hallucinate):
+        "What scholarships does Stanford University offer for medical students?",
     ]
 
     print("=" * 70)
-    print(f"RETRIEVAL TEST — top-{TOP_K} chunks for each question")
+    print("GROUNDED GENERATION TEST (answer + sources)")
     print("=" * 70)
 
-    for q_number, question in enumerate(test_questions, start=1):
+    for q_number, question in enumerate(generation_questions, start=1):
         print(f"\n########## QUESTION {q_number} ##########")
         print(f"Q: {question}\n")
 
-        hits = retrieve(question, collection, model, k=TOP_K)
+        result = ask(question)   # the full end-to-end pipeline
 
-        # Print each retrieved chunk with its source and a relevance score so I
-        # can see WHICH file it came from and HOW close it was to the question.
-        for rank, hit in enumerate(hits, start=1):
-            print(f"  --- Result {rank} (relevance: {hit['relevance']:.3f}) ---")
-            print(f"  Source: {hit['filename']}  (chunk {hit['chunk_index']})")
-            print(f"  Text: {hit['text']}")
-            print()
+        print("ANSWER:")
+        print(result["answer"])
+        print("\nSOURCES (chunks retrieved from):")
+        for source in result["sources"]:
+            print(f"  • {source}")
+        print("-" * 70)
 
 
 # This standard Python line means: "only run main() if this file is executed
