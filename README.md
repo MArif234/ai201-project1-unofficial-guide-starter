@@ -155,6 +155,8 @@
 - *What it produced:*
 - *What I changed or overrode:*
 
+For milestone three, I had Claude in my terminal, so I had it look at the chunking strategy section of my planning.md document. It was able to split things up into chunks, and the chunks were around 700 characters, like I wanted. What happened is that, with some of the chunks, the chunks weren't whole words because it would cut itself off at the character limit. For some of the chunks, some words were being cut off. It still somewhat made sense, but I wanted it to be cleaner. One thing I had to do was have it chunk it so it chunks at the end of a word. It's okay if the characters aren't exactly 700, but I just wanted the wording to be clear. 
+
 **Instance 2**
 
 - *What I gave the AI:*

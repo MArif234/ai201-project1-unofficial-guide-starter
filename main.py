@@ -36,6 +36,16 @@ from pathlib import Path
 # quotes, etc.) never crash the program when we print a chunk.
 import sys
 
+# --- Milestone 4 libraries (these need to be pip-installed) ---
+# SentenceTransformer is the tool that turns a piece of text into a list of
+# numbers (a "vector" / "embedding") that captures its meaning. Two texts with
+# similar meaning get similar numbers.
+from sentence_transformers import SentenceTransformer
+
+# chromadb is the "vector database": it stores all those number-lists and can
+# very quickly find which stored chunks are closest in meaning to a question.
+import chromadb
+
 # By default the Windows console uses an older text encoding (cp1252) that
 # can't handle some characters our documents contain. This line switches the
 # console output to UTF-8, which handles everything. (Safe to leave in.)
@@ -55,6 +65,16 @@ CHUNK_OVERLAP = 150   # Each chunk repeats the last 150 chars of the previous on
 # is the folder it sits in. So this points to the "documents" folder that is
 # right next to main.py — no matter what computer this runs on.
 DOCUMENTS_DIR = Path(__file__).parent / "documents"
+
+# --- Milestone 4 settings (from my planning.md Retrieval Approach) ---
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"   # local model, no API key, no rate limits
+TOP_K = 4                                   # how many chunks to retrieve per question
+
+# Where ChromaDB saves its database files on disk. Storing it (instead of only
+# in memory) means later milestones can reuse it without re-embedding. It lives
+# in a "chroma_db" folder next to main.py.
+CHROMA_DIR = Path(__file__).parent / "chroma_db"
+COLLECTION_NAME = "scholarships"            # a name for our group of stored chunks
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +259,134 @@ def chunk_all_documents(documents: list[dict]) -> list[dict]:
     return all_chunks
 
 
+# ===========================================================================
+# MILESTONE 4: EMBEDDING + STORING + RETRIEVAL
+# ===========================================================================
+
 # ---------------------------------------------------------------------------
-# STEP 4: THE MAIN PROGRAM  (this is what actually runs)
+# STEP 4a: BUILD THE VECTOR STORE
+# ---------------------------------------------------------------------------
+def build_vector_store(all_chunks: list[dict]):
+    """
+    Turn every chunk into an embedding and store it in ChromaDB.
+
+    "Embedding" = converting text into a list of numbers that represents its
+    meaning. The model 'all-MiniLM-L6-v2' produces a 384-number vector for
+    each chunk. Chunks about similar topics end up with similar numbers, which
+    is what lets us search by *meaning* instead of exact keyword matching.
+
+    Returns BOTH:
+      - the ChromaDB collection (the searchable database of our chunks), and
+      - the loaded embedding model (we reuse it to embed questions later).
+    """
+    # --- Load the embedding model ---
+    # The first time this runs it downloads the model (~90 MB) from the
+    # internet; after that it's cached on your computer and loads instantly.
+    print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}' (first run downloads it)...")
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    # --- Pull the three parallel lists ChromaDB wants ---
+    # For each chunk we need: the text itself, a unique id, and its metadata
+    # (the source info). We build these as three lists that line up by position.
+    texts = [chunk["text"] for chunk in all_chunks]
+
+    # A unique id per chunk, e.g. "gem_fellowship.txt::chunk-0". ChromaDB
+    # requires every stored item to have a unique id.
+    ids = [f'{chunk["filename"]}::chunk-{chunk["chunk_index"]}' for chunk in all_chunks]
+
+    # Metadata = the source info we attach to each chunk so a search result can
+    # tell us which file (and which chunk) it came from. This is the "source
+    # metadata" the milestone asks for.
+    metadatas = [
+        {"filename": chunk["filename"], "chunk_index": chunk["chunk_index"]}
+        for chunk in all_chunks
+    ]
+
+    # --- Embed all the chunk texts at once ---
+    # normalize_embeddings=True scales each vector to length 1, which makes the
+    # cosine-similarity math (used below) clean and well-behaved.
+    print(f"Embedding {len(texts)} chunks into vectors...")
+    embeddings = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+    # --- Connect to ChromaDB and create a fresh collection ---
+    # PersistentClient saves the database to the CHROMA_DIR folder on disk.
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+
+    # We rebuild from scratch every run so the database always matches the
+    # current documents. delete_collection errors if it doesn't exist yet, so
+    # we wrap it in try/except and just ignore that "not found" case.
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+
+    # Create the collection. metadata={"hnsw:space": "cosine"} tells ChromaDB
+    # to measure closeness using COSINE similarity (good for comparing meaning),
+    # rather than its default straight-line distance.
+    collection = client.create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    # --- Store everything ---
+    # .tolist() converts the model's numpy output into plain Python lists,
+    # which is the format ChromaDB expects.
+    collection.add(
+        ids=ids,
+        documents=texts,
+        embeddings=embeddings.tolist(),
+        metadatas=metadatas,
+    )
+
+    print(f"Stored {collection.count()} chunks in ChromaDB (saved to {CHROMA_DIR}).\n")
+    return collection, model
+
+
+# ---------------------------------------------------------------------------
+# STEP 4b: THE RETRIEVAL FUNCTION
+# ---------------------------------------------------------------------------
+def retrieve(query: str, collection, model, k: int = TOP_K) -> list[dict]:
+    """
+    Given a question, return the k most relevant chunks WITH their source info.
+
+    How it works:
+      1. Embed the question with the SAME model used for the chunks (so the
+         numbers are comparable).
+      2. Ask ChromaDB for the k chunks whose vectors are closest to it.
+      3. Repackage the results into a tidy list of dictionaries.
+    """
+    # Embed the question. We wrap it in a list because .encode expects a list,
+    # then it returns one vector for our one question.
+    query_embedding = model.encode([query], normalize_embeddings=True).tolist()
+
+    # Ask the database for the k closest chunks to that vector.
+    results = collection.query(query_embeddings=query_embedding, n_results=k)
+
+    # ChromaDB returns its answers wrapped in an extra list (one slot per query
+    # we sent). We sent one query, so we grab index [0] of each returned list.
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    # Build a clean list of hits. zip(...) walks the three lists together so
+    # each chunk's text, source, and distance stay matched up.
+    hits = []
+    for text, meta, distance in zip(documents, metadatas, distances):
+        hits.append({
+            "filename": meta["filename"],
+            "chunk_index": meta["chunk_index"],
+            "text": text,
+            "distance": distance,            # cosine distance: 0 = identical, bigger = less similar
+            "relevance": 1 - distance,       # flipped so HIGHER = more relevant (easier to read)
+        })
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# STEP 5: THE MAIN PROGRAM  (this is what actually runs)
 # ---------------------------------------------------------------------------
 def main():
-    """Run the full Milestone 3 pipeline: load -> chunk -> report -> inspect."""
+    """Run the pipeline: load -> chunk -> embed/store -> test retrieval."""
     # ---- Load every document from the documents/ folder ----
     print("Loading documents from:", DOCUMENTS_DIR)
     documents = load_documents(DOCUMENTS_DIR)
@@ -262,29 +405,60 @@ def main():
         print(f"Average chunk length: {average_length:.0f} characters")
         print(f"Shortest chunk: {min(lengths)} chars | Longest chunk: {max(lengths)} chars\n")
 
-    # ---- Print 5 REPRESENTATIVE chunks to eyeball ----
-    # Instead of just the first 5 (which would all come from one document),
-    # we pick 5 chunks spread evenly across the whole list. That way we see
-    # samples from different documents and different positions.
+    # ---- (Milestone 3) Optionally print 5 representative chunks ----
+    # We already inspected these in Milestone 3, so this is off by default to
+    # keep the output focused on retrieval. Flip the flag to True to see them.
+    SHOW_CHUNK_SAMPLES = False
+    if SHOW_CHUNK_SAMPLES:
+        print("=" * 70)
+        print("5 REPRESENTATIVE CHUNKS (read these — do they make sense alone?)")
+        print("=" * 70)
+        total = len(all_chunks)
+        sample_count = min(5, total)
+        for n in range(sample_count):
+            index = (n * total) // sample_count   # evenly spaced index
+            chunk = all_chunks[index]
+            print(f"\n--- Sample {n + 1} of {sample_count} ---")
+            print(f"Source file : {chunk['filename']}")
+            print(f"Chunk number: {chunk['chunk_index']}")
+            print(f"Length      : {len(chunk['text'])} characters")
+            print("Text:")
+            print(chunk["text"])
+            print("-" * 70)
+
+    # ---- (Milestone 4) Embed the chunks and store them in ChromaDB ----
+    collection, model = build_vector_store(all_chunks)
+
+    # ---- (Milestone 4) Test retrieval on my first 3 evaluation questions ----
+    # These come straight from the Evaluation Plan in planning.md. For each one
+    # we retrieve the top-k chunks and print them so I can judge whether the
+    # RIGHT pieces of text were found (before any AI answer is generated).
+    test_questions = [
+        "What is a specific full-tuition scholarship or fellowship that a Heinz "
+        "Information Systems Management student could win?",
+        "What specific colleges or universities partner with Heinz College at "
+        "Carnegie Mellon University to receive scholarships?",
+        "Can you list the merit-based scholarships that an information systems "
+        "management student at Heinz College could win based on their college application?",
+    ]
+
     print("=" * 70)
-    print("5 REPRESENTATIVE CHUNKS (read these — do they make sense alone?)")
+    print(f"RETRIEVAL TEST — top-{TOP_K} chunks for each question")
     print("=" * 70)
 
-    total = len(all_chunks)
-    # Pick 5 evenly spaced positions: e.g. if there are 50 chunks, this grabs
-    # roughly chunks 0, 10, 20, 30, 40.
-    sample_count = min(5, total)  # don't ask for more than we have
-    for n in range(sample_count):
-        index = (n * total) // sample_count   # evenly spaced index
-        chunk = all_chunks[index]
+    for q_number, question in enumerate(test_questions, start=1):
+        print(f"\n########## QUESTION {q_number} ##########")
+        print(f"Q: {question}\n")
 
-        print(f"\n--- Sample {n + 1} of {sample_count} ---")
-        print(f"Source file : {chunk['filename']}")
-        print(f"Chunk number: {chunk['chunk_index']}")
-        print(f"Length      : {len(chunk['text'])} characters")
-        print("Text:")
-        print(chunk["text"])
-        print("-" * 70)
+        hits = retrieve(question, collection, model, k=TOP_K)
+
+        # Print each retrieved chunk with its source and a relevance score so I
+        # can see WHICH file it came from and HOW close it was to the question.
+        for rank, hit in enumerate(hits, start=1):
+            print(f"  --- Result {rank} (relevance: {hit['relevance']:.3f}) ---")
+            print(f"  Source: {hit['filename']}  (chunk {hit['chunk_index']})")
+            print(f"  Text: {hit['text']}")
+            print()
 
 
 # This standard Python line means: "only run main() if this file is executed
