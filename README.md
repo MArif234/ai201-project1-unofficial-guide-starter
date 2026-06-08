@@ -178,7 +178,7 @@ The expected answer is written above, and overall the retrieval quality is parti
 4. For the What is Your Trademark Scholarship Essay Contest, what is the essay prompt? 
 Answer: We want students to consider what they will be known for when their career is over.  We want to know what your personal brand will be, how you will impact society, and how the $2500 will help you achieve your goals. Essays should be kept to 500 words or less.
 
-For this answer, I would say that the retrieval quality is relevant and the response accuracy is also accurate. It listed out the whole prompt for the essay, which was good. The one caveat with this response is that it didn't include the word count that the essay is supposed to be at, but I'm going to let that go because specifically in this question it was only asking for the essay prompt and not the word count. I feel like the word count is extra information. 
+For this answer, I would say that the retrieval quality is relevant and the response accuracy is also accurate. It listed out the whole prompt for the essay, which was good. The one caveat with this response is that it did include the word count that the essay is supposed to be at, but I'm going to let that go because specifically in this question it was only asking for the essay prompt and not the word count. I feel like the word count is extra information. 
 
 5. If a student were to win the Deliberative Discourse Fellowship, how much money would they be earning? 
 Answer: 
